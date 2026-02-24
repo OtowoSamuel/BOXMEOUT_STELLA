@@ -1,5 +1,5 @@
 // backend/src/routes/trading.ts
-// Trading routes - buy/sell shares and get odds
+// Trading routes - handles both direct trading and user-signed transaction flows
 
 import { Router } from 'express';
 import { tradingController } from '../controllers/trading.controller.js';
@@ -7,33 +7,12 @@ import { requireAuth } from '../middleware/auth.middleware.js';
 
 const router: Router = Router();
 
+// ─── Direct Trading / Admin-signed Routes ────────────────────────────────────
+// These are typically mounted at /api/markets
+
 /**
  * POST /api/markets/:marketId/buy - Buy Outcome Shares
  * Requires authentication
- *
- * Request Body:
- * {
- *   outcome: 0 | 1,  // 0 for NO, 1 for YES
- *   amount: number,   // USDC amount to spend
- *   minShares?: number  // Minimum shares to receive (slippage protection)
- * }
- *
- * Response:
- * {
- *   success: true,
- *   data: {
- *     sharesBought: number,
- *     pricePerUnit: number,
- *     totalCost: number,
- *     feeAmount: number,
- *     txHash: string,
- *     tradeId: string,
- *     position: {
- *       totalShares: number,
- *       averagePrice: number
- *     }
- *   }
- * }
  */
 router.post('/:marketId/buy', requireAuth, (req, res) =>
   tradingController.buyShares(req, res)
@@ -42,27 +21,6 @@ router.post('/:marketId/buy', requireAuth, (req, res) =>
 /**
  * POST /api/markets/:marketId/sell - Sell Outcome Shares
  * Requires authentication
- *
- * Request Body:
- * {
- *   outcome: 0 | 1,    // 0 for NO, 1 for YES
- *   shares: number,     // Number of shares to sell
- *   minPayout?: number  // Minimum payout to receive (slippage protection)
- * }
- *
- * Response:
- * {
- *   success: true,
- *   data: {
- *     sharesSold: number,
- *     pricePerUnit: number,
- *     payout: number,
- *     feeAmount: number,
- *     txHash: string,
- *     tradeId: string,
- *     remainingShares: number
- *   }
- * }
  */
 router.post('/:marketId/sell', requireAuth, (req, res) =>
   tradingController.sellShares(req, res)
@@ -70,25 +28,6 @@ router.post('/:marketId/sell', requireAuth, (req, res) =>
 
 /**
  * GET /api/markets/:marketId/odds - Get Current Market Odds
- * No authentication required
- *
- * Response:
- * {
- *   success: true,
- *   data: {
- *     yes: {
- *       odds: number,        // 0.0 to 1.0
- *       percentage: number,  // 0 to 100
- *       liquidity: number
- *     },
- *     no: {
- *       odds: number,
- *       percentage: number,
- *       liquidity: number
- *     },
- *     totalLiquidity: number
- *   }
- * }
  */
 router.get('/:marketId/odds', (req, res) =>
   tradingController.getOdds(req, res)
@@ -96,21 +35,6 @@ router.get('/:marketId/odds', (req, res) =>
 
 /**
  * POST /api/markets/:marketId/liquidity/add - Add USDC Liquidity to Pool
- * Requires authentication
- *
- * Request Body:
- * {
- *   usdcAmount: string  // Amount of USDC to deposit (integer string)
- * }
- *
- * Response:
- * {
- *   success: true,
- *   data: {
- *     lpTokensMinted: string,
- *     txHash: string
- *   }
- * }
  */
 router.post('/:marketId/liquidity/add', requireAuth, (req, res) =>
   tradingController.addLiquidity(req, res)
@@ -118,26 +42,36 @@ router.post('/:marketId/liquidity/add', requireAuth, (req, res) =>
 
 /**
  * POST /api/markets/:marketId/liquidity/remove - Remove Liquidity from Pool
- * Requires authentication
- *
- * Request Body:
- * {
- *   lpTokens: string  // LP tokens to redeem (integer string)
- * }
- *
- * Response:
- * {
- *   success: true,
- *   data: {
- *     yesAmount: string,
- *     noAmount: string,
- *     totalUsdcReturned: string,
- *     txHash: string
- *   }
- * }
  */
 router.post('/:marketId/liquidity/remove', requireAuth, (req, res) =>
   tradingController.removeLiquidity(req, res)
+);
+
+// ─── User-signed Transaction Routes ──────────────────────────────────────────
+// These are typically mounted at /api
+
+/**
+ * POST /api/markets/:marketId/build-tx/buy
+ * Build an unsigned transaction for buying shares
+ */
+router.post('/markets/:marketId/build-tx/buy', requireAuth, (req, res) =>
+  tradingController.buildBuySharesTx(req, res)
+);
+
+/**
+ * POST /api/markets/:marketId/build-tx/sell
+ * Build an unsigned transaction for selling shares
+ */
+router.post('/markets/:marketId/build-tx/sell', requireAuth, (req, res) =>
+  tradingController.buildSellSharesTx(req, res)
+);
+
+/**
+ * POST /api/submit-signed-tx
+ * Submit a pre-signed transaction
+ */
+router.post('/submit-signed-tx', requireAuth, (req, res) =>
+  tradingController.submitSignedTx(req, res)
 );
 
 export default router;
