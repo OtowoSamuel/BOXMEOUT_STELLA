@@ -14,6 +14,7 @@
 /// All values use i128 and a fixed SCALE = 10_000_000 (7 decimal places, matching Stellar stroops).
 
 use crate::types::AmmPool;
+use soroban_sdk::{Env, Vec};
 
 /// Fixed-point scale used throughout AMM math to avoid floating-point.
 pub const SCALE: i128 = 10_000_000;
@@ -32,7 +33,7 @@ pub const SCALE: i128 = 10_000_000;
 /// - Return a Vec<i128> of length `n_outcomes` where every element equals
 ///   `collateral / n_outcomes` (integer division; any remainder goes into reserve_0).
 /// - The equal-reserve start sets each outcome price to exactly `1/n`.
-pub fn calc_initial_reserves(collateral: i128, n_outcomes: u32) -> Vec<i128> {
+pub fn calc_initial_reserves(_env: &Env, collateral: i128, n_outcomes: u32) -> Vec<i128> {
     todo!("Compute equal initial reserves from seeding collateral")
 }
 
