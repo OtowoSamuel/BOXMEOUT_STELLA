@@ -4239,3 +4239,450 @@ mod split_position_tests {
     }
 
 }
+
+// ---------------------------------------------------------------------------
+// sell_shares unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod sell_shares_tests {
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        token, Address, BytesN, Env,
+    };
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    fn create_token<'a>(env: &Env, admin: &Address) -> token::StellarAssetClient<'a> {
+        let addr = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        token::StellarAssetClient::new(env, &addr)
+    }
+
+    /// Registers the contract, initialises it, seeds a market and a position,
+    /// and mints collateral into the contract so payouts can be made.
+    fn setup_sell(
+        outcome: u32,
+        yes_reserve: i128,
+        no_reserve: i128,
+        user_shares: i128,
+    ) -> (
+        Env,
+        PredictionMarketContractClient<'static>,
+        Address, // contract id
+        Address, // seller
+        Address, // treasury
+        Address, // creator
+        BytesN<32>,
+        token::StellarAssetClient<'static>,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let usdc = create_token(&env, &token_admin);
+
+        let cid = env.register(PredictionMarketContract, ());
+        let client = PredictionMarketContractClient::new(&env, &cid);
+
+        // Initialise with 2% protocol fee, 1% creator fee
+        client
+            .try_initialize(
+                &admin,
+                &treasury,
+                &oracle,
+                &usdc.address,
+                &200u32,
+                &100u32,
+                &1_000i128,
+                &100i128,
+                &2u32,
+                &500i128,
+            )
+            .unwrap();
+
+        let market_id = BytesN::from_array(&env, &[1u8; 32]);
+
+        // Ledger time = 1000; betting closes at 5000
+        env.ledger().with_mut(|l| l.timestamp = 1_000);
+        client.test_setup_market(
+            &market_id,
+            &creator,
+            &5_000u64,
+            &yes_reserve,
+            &no_reserve,
+        );
+        client.test_set_position(&market_id, &Address::generate(&env), &outcome, &0i128); // dummy
+        let seller = Address::generate(&env);
+        client.test_set_position(&market_id, &seller, &outcome, &user_shares);
+
+        // Mint enough collateral into the contract to cover any payout
+        usdc.mint(&cid, &1_000_000i128);
+
+        (env, client, cid, seller, treasury, creator, market_id, usdc)
+    }
+
+    // ── happy path ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_sell_shares_happy_path_yes() {
+        // YES pool: 500_000, NO pool: 500_000
+        // Sell 10_000 YES shares
+        // gross = 10_000 * 500_000 / (500_000 + 10_000) = 9_803 (floor)
+        // protocol_fee = 9_803 * 200 / 10_000 = 196
+        // creator_fee  = 9_803 * 100 / 10_000 = 98
+        // net = 9_803 - 196 - 98 = 9_509
+        let (env, client, _cid, seller, _treasury, _creator, market_id, usdc) =
+            setup_sell(1, 500_000, 500_000, 50_000);
+
+        let receipt = client
+            .sell_shares(&market_id, &seller, &1u32, &10_000i128, &0i128)
+            .unwrap();
+
+        assert_eq!(receipt.shares_sold, 10_000);
+        assert_eq!(receipt.gross_collateral, 9_803);
+        assert_eq!(receipt.protocol_fee, 196);
+        assert_eq!(receipt.creator_fee, 98);
+        assert_eq!(receipt.net_collateral_out, 9_509);
+
+        // Seller received net payout
+        assert_eq!(usdc.balance(&seller), 9_509);
+
+        // Position reduced
+        let pos = client.test_get_position(&market_id, &seller, &1u32);
+        assert_eq!(pos.unwrap().shares, 40_000);
+
+        // Reserves updated: YES += shares_in, NO -= gross
+        let (yes, no) = client.test_get_reserves(&market_id);
+        assert_eq!(yes, 510_000);
+        assert_eq!(no, 490_197); // 500_000 - 9_803
+    }
+
+    #[test]
+    fn test_sell_shares_removes_position_when_zeroed() {
+        let (env, client, _cid, seller, _treasury, _creator, market_id, _usdc) =
+            setup_sell(0, 500_000, 500_000, 10_000);
+
+        // Sell entire position
+        client
+            .sell_shares(&market_id, &seller, &0u32, &10_000i128, &0i128)
+            .unwrap();
+
+        // Position key must be gone
+        let pos = client.test_get_position(&market_id, &seller, &0u32);
+        assert!(pos.is_none());
+    }
+
+    #[test]
+    fn test_sell_shares_emits_event() {
+        let (env, client, _cid, seller, _treasury, _creator, market_id, _usdc) =
+            setup_sell(1, 500_000, 500_000, 20_000);
+
+        client
+            .sell_shares(&market_id, &seller, &1u32, &5_000i128, &0i128)
+            .unwrap();
+
+        assert!(!env.events().all().is_empty());
+    }
+
+    // ── sell more than held is rejected ──────────────────────────────────────
+
+    #[test]
+    fn test_sell_more_than_held_rejected() {
+        let (env, client, _cid, seller, _treasury, _creator, market_id, _usdc) =
+            setup_sell(1, 500_000, 500_000, 5_000);
+
+        let result =
+            client.try_sell_shares(&market_id, &seller, &1u32, &10_000i128, &0i128);
+        assert_eq!(
+            result,
+            Err(Ok(PredictionMarketError::InsufficientShares))
+        );
+    }
+
+    // ── slippage guard ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_slippage_guard_rejects_when_net_below_min() {
+        // gross ≈ 9_803, net ≈ 9_509 — demand 10_000 → should fail
+        let (env, client, _cid, seller, _treasury, _creator, market_id, _usdc) =
+            setup_sell(1, 500_000, 500_000, 50_000);
+
+        let result =
+            client.try_sell_shares(&market_id, &seller, &1u32, &10_000i128, &10_000i128);
+        assert_eq!(
+            result,
+            Err(Ok(PredictionMarketError::SlippageExceeded))
+        );
+    }
+
+    #[test]
+    fn test_slippage_guard_passes_when_net_meets_min() {
+        let (env, client, _cid, seller, _treasury, _creator, market_id, _usdc) =
+            setup_sell(1, 500_000, 500_000, 50_000);
+
+        // min_collateral_out = 9_509 (exact net) — should succeed
+        let result =
+            client.try_sell_shares(&market_id, &seller, &1u32, &10_000i128, &9_509i128);
+        assert!(result.is_ok());
+    }
+
+    // ── double-sell after zeroing ─────────────────────────────────────────────
+
+    #[test]
+    fn test_double_sell_after_zeroing_rejected() {
+        let (env, client, _cid, seller, _treasury, _creator, market_id, _usdc) =
+            setup_sell(1, 500_000, 500_000, 10_000);
+
+        // First sell — clears position
+        client
+            .sell_shares(&market_id, &seller, &1u32, &10_000i128, &0i128)
+            .unwrap();
+
+        // Second sell — position key is gone → NoPosition
+        let result =
+            client.try_sell_shares(&market_id, &seller, &1u32, &1i128, &0i128);
+        assert_eq!(result, Err(Ok(PredictionMarketError::NoPosition)));
+    }
+
+    // ── pause guard ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_sell_rejected_when_paused() {
+        let (env, client, cid, seller, _treasury, _creator, market_id, _usdc) =
+            setup_sell(1, 500_000, 500_000, 10_000);
+
+        // Manually set pause flag
+        env.as_contract(&cid, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::EmergencyPause, &true);
+        });
+
+        let result =
+            client.try_sell_shares(&market_id, &seller, &1u32, &5_000i128, &0i128);
+        assert_eq!(result, Err(Ok(PredictionMarketError::ContractPaused)));
+    }
+
+    // ── betting window closed ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_sell_rejected_after_betting_close() {
+        let (env, client, _cid, seller, _treasury, _creator, market_id, _usdc) =
+            setup_sell(1, 500_000, 500_000, 10_000);
+
+        // Advance past betting_close_time (5000)
+        env.ledger().with_mut(|l| l.timestamp = 6_000);
+
+        let result =
+            client.try_sell_shares(&market_id, &seller, &1u32, &5_000i128, &0i128);
+        assert_eq!(result, Err(Ok(PredictionMarketError::BettingClosed)));
+    }
+
+    // ── market not open ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_sell_rejected_when_market_not_open() {
+        let (env, client, cid, seller, _treasury, _creator, market_id, _usdc) =
+            setup_sell(1, 500_000, 500_000, 10_000);
+
+        // Close the market
+        env.as_contract(&cid, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::MarketState(market_id.clone()), &MARKET_CLOSED);
+        });
+
+        let result =
+            client.try_sell_shares(&market_id, &seller, &1u32, &5_000i128, &0i128);
+        assert_eq!(result, Err(Ok(PredictionMarketError::MarketNotOpen)));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// split_position unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod split_position_tests {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, token, Address, BytesN, Env};
+
+    fn create_token<'a>(env: &Env, admin: &Address) -> token::StellarAssetClient<'a> {
+        let addr = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        token::StellarAssetClient::new(env, &addr)
+    }
+
+    /// Registers + initialises the contract, seeds an open market, mints
+    /// `caller_balance` collateral to `caller`, and returns everything needed.
+    fn setup(
+        num_outcomes: u32,
+        caller_balance: i128,
+    ) -> (
+        Env,
+        PredictionMarketContractClient<'static>,
+        Address, // contract id
+        Address, // caller
+        BytesN<32>,
+        token::StellarAssetClient<'static>,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let oracle = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let usdc = create_token(&env, &token_admin);
+
+        let cid = env.register(PredictionMarketContract, ());
+        let client = PredictionMarketContractClient::new(&env, &cid);
+
+        client
+            .try_initialize(
+                &admin,
+                &treasury,
+                &oracle,
+                &usdc.address,
+                &200u32,
+                &100u32,
+                &1_000i128,
+                &100i128,
+                &num_outcomes,
+                &500i128,
+            )
+            .unwrap();
+
+        let market_id = BytesN::from_array(&env, &[2u8; 32]);
+        let creator = Address::generate(&env);
+        client.test_setup_market(&market_id, &creator, &9_999_999u64, &500_000, &500_000);
+        client.test_set_num_outcomes(&market_id, &num_outcomes);
+
+        let caller = Address::generate(&env);
+        usdc.mint(&caller, &caller_balance);
+        // Also mint into contract so merge can pay back
+        usdc.mint(&cid, &caller_balance);
+
+        (env, client, cid, caller, market_id, usdc)
+    }
+
+    // ── happy path ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_split_mints_one_share_per_outcome() {
+        let (_env, client, _cid, caller, market_id, _usdc) = setup(2, 1_000);
+
+        client.split_position(&market_id, &caller, &1_000i128).unwrap();
+
+        // Both outcomes get 1_000 shares
+        assert_eq!(
+            client.test_get_position(&market_id, &caller, &0u32).unwrap().shares,
+            1_000
+        );
+        assert_eq!(
+            client.test_get_position(&market_id, &caller, &1u32).unwrap().shares,
+            1_000
+        );
+    }
+
+    #[test]
+    fn test_split_updates_total_shares_outstanding() {
+        let (_env, client, _cid, caller, market_id, _usdc) = setup(2, 500);
+
+        client.split_position(&market_id, &caller, &500i128).unwrap();
+
+        assert_eq!(client.test_get_total_shares(&market_id, &0u32), 500);
+        assert_eq!(client.test_get_total_shares(&market_id, &1u32), 500);
+    }
+
+    #[test]
+    fn test_split_transfers_collateral_to_contract() {
+        let (_env, client, cid, caller, market_id, usdc) = setup(2, 1_000);
+
+        let before = usdc.balance(&caller);
+        client.split_position(&market_id, &caller, &1_000i128).unwrap();
+        assert_eq!(usdc.balance(&caller), before - 1_000);
+        // contract received it (net: minted 1_000 extra above, so balance >= 1_000)
+        assert!(usdc.balance(&cid) >= 1_000);
+    }
+
+    #[test]
+    fn test_split_emits_event() {
+        let (env, client, _cid, caller, market_id, _usdc) = setup(2, 200);
+        client.split_position(&market_id, &caller, &200i128).unwrap();
+        assert!(!env.events().all().is_empty());
+    }
+
+    // ── split → merge returns original collateral ─────────────────────────────
+
+    #[test]
+    fn test_split_then_merge_returns_original_collateral() {
+        let (_env, client, _cid, caller, market_id, usdc) = setup(2, 1_000);
+
+        let before = usdc.balance(&caller);
+
+        client.split_position(&market_id, &caller, &1_000i128).unwrap();
+        assert_eq!(usdc.balance(&caller), before - 1_000);
+
+        client.merge_position(&market_id, &caller, &1_000i128).unwrap();
+        assert_eq!(usdc.balance(&caller), before);
+
+        // Positions cleaned up
+        assert!(client.test_get_position(&market_id, &caller, &0u32).is_none());
+        assert!(client.test_get_position(&market_id, &caller, &1u32).is_none());
+    }
+
+    // ── error cases ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_split_zero_collateral_rejected() {
+        let (_env, client, _cid, caller, market_id, _usdc) = setup(2, 1_000);
+        let result = client.try_split_position(&market_id, &caller, &0i128);
+        assert_eq!(result, Err(Ok(PredictionMarketError::InvalidCollateral)));
+    }
+
+    #[test]
+    fn test_split_market_not_open_rejected() {
+        let (env, client, cid, caller, market_id, _usdc) = setup(2, 1_000);
+        env.as_contract(&cid, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::MarketState(market_id.clone()), &MARKET_CLOSED);
+        });
+        let result = client.try_split_position(&market_id, &caller, &500i128);
+        assert_eq!(result, Err(Ok(PredictionMarketError::MarketNotOpen)));
+    }
+
+    #[test]
+    fn test_split_paused_rejected() {
+        let (env, client, cid, caller, market_id, _usdc) = setup(2, 1_000);
+        env.as_contract(&cid, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::EmergencyPause, &true);
+        });
+        let result = client.try_split_position(&market_id, &caller, &500i128);
+        assert_eq!(result, Err(Ok(PredictionMarketError::ContractPaused)));
+    }
+
+    #[test]
+    fn test_merge_insufficient_shares_rejected() {
+        let (_env, client, _cid, caller, market_id, _usdc) = setup(2, 1_000);
+
+        // Split 500, then try to merge 600
+        client.split_position(&market_id, &caller, &500i128).unwrap();
+        let result = client.try_merge_position(&market_id, &caller, &600i128);
+        assert_eq!(
+            result,
+            Err(Ok(PredictionMarketError::InsufficientSharesForMerge))
+        );
+    }
+}
